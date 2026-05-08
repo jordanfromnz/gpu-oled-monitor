@@ -1,0 +1,8 @@
+{
+  "line1": "gpu_temp",
+  "line2": "gpu_power",
+  "alt_line1": "ram_used",
+  "alt_line2": "cpu_util",
+  "cycle_enabled": true,
+  "cycle_seconds": 4
+}
