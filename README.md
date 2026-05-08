@@ -19,7 +19,7 @@ Single `.exe`. No HWiNFO. No INI editing. Pick your stats, click run.
 **GPU** — temperature, power draw, usage %, VRAM used, VRAM %, fan %, core clock, memory clock
 **System** — CPU usage %, RAM usage %, RAM used
 
-CPU temperature isn't availalble for now — reading it would require integration with HWInfo Stats. If you need CPU temp or other stats not available from nvml, [HWiNFO-SteelSeries](https://github.com/ForbesGRyan/HWiNFO-SteelSeries) covers that path well. This was primarilyy built as a GPU monitoring display for temp and power draw.
+CPU temperature isn't availalble for now — reading it would require integration with HWInfo Stats. If you need CPU temp or other stats not available from nvml, [HWiNFO-SteelSeries](https://github.com/ForbesGRyan/HWiNFO-SteelSeries) covers that path well. This was primarily built as a GPU monitoring display for temp and power draw.
 
 ## Requirements
 
