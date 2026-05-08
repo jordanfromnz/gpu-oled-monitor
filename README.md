@@ -102,4 +102,4 @@ python -m PyInstaller --noconfirm --noconsole --onefile --name "GPU-OLED-Monitor
 
 MIT — see [LICENSE](LICENSE).
 
-made by jordanfromnz
+made by jordanfromnz for all the people who bought a keyboard mainly for this purpose only to have the app go missing :D
