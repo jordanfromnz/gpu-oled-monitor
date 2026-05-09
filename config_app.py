@@ -7,6 +7,7 @@ from pathlib import Path
 
 import customtkinter as ctk
 import psutil
+import winreg
 
 from gpu_backend import get_backend, list_gpus
 from stats import STATS, current_lines, render_line
@@ -17,7 +18,6 @@ PROJECT_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 CONFIG_FILE = PROJECT_DIR / "config.json"
 SCRIPT_FILE = PROJECT_DIR / "gpu_oled.py"
 PID_FILE = PROJECT_DIR / "gpu_oled.pid"
-TASK_NAME = "GPU OLED Monitor"
 
 DEFAULT_CONFIG = {
     "line1": "gpu_temp",
@@ -27,6 +27,14 @@ DEFAULT_CONFIG = {
     "cycle_enabled": False,
     "cycle_seconds": 4,
     "gpu_id": "auto",
+    "temp_warning_enabled": False,
+    "temp_warning_threshold": 80,
+    "overlay_x": 100,
+    "overlay_y": 100,
+    "power_warning_enabled": False,
+    "power_warning_threshold": 600,
+    "power_overlay_x": 100,
+    "power_overlay_y": 210,
 }
 
 
@@ -86,33 +94,54 @@ def stop_monitor() -> None:
     PID_FILE.unlink(missing_ok=True)
 
 
+RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "GPU OLED Monitor"
+
+
+def _autostart_command_line() -> str:
+    """Quoted command-line string suitable for the Run registry value."""
+    return subprocess.list2cmdline(daemon_command())
+
+
 def is_autostart_enabled() -> bool:
-    result = subprocess.run(
-        ["schtasks", "/query", "/tn", TASK_NAME],
-        capture_output=True, text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-    return result.returncode == 0
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_READ) as key:
+            winreg.QueryValueEx(key, RUN_VALUE_NAME)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def _cleanup_legacy_scheduled_task() -> None:
+    """Quietly remove the old schtasks entry from earlier versions, if present.
+
+    No-op if the task doesn't exist or schtasks isn't available.
+    """
+    try:
+        subprocess.run(
+            ["schtasks", "/delete", "/tn", "GPU OLED Monitor", "/f"],
+            capture_output=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        pass
 
 
 def install_autostart() -> None:
-    cmd = daemon_command()
-    tr = " ".join(f'"{c}"' if " " in c else c for c in cmd)
-    subprocess.run([
-        "schtasks", "/create",
-        "/tn", TASK_NAME,
-        "/tr", tr,
-        "/sc", "onlogon",
-        "/rl", "limited",
-        "/f",
-    ], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    _cleanup_legacy_scheduled_task()
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, _autostart_command_line())
 
 
 def uninstall_autostart() -> None:
-    subprocess.run(
-        ["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
-        check=True, creationflags=subprocess.CREATE_NO_WINDOW,
-    )
+    _cleanup_legacy_scheduled_task()
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, RUN_VALUE_NAME)
+    except FileNotFoundError:
+        pass
 
 
 PAD_X = 24
@@ -127,7 +156,7 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("GPU OLED Monitor")
-        self.geometry("420x880")
+        self.geometry("420x1000")
         self.resizable(False, False)
 
         self.config_data = load_config()
@@ -215,6 +244,41 @@ class App(ctk.CTk):
         self.interval_entry.bind("<Return>", lambda _: self._on_change())
         ctk.CTkLabel(interval_row, text="seconds").pack(side="left")
 
+        # --- Warnings card ---
+        warn_card = ctk.CTkFrame(self, fg_color=CARD_BG, corner_radius=10)
+        warn_card.pack(fill="x", padx=PAD_X, pady=(0, 12))
+        self._section(warn_card, "Warnings")
+
+        # Temp
+        self.warn_var = ctk.BooleanVar(value=self.config_data["temp_warning_enabled"])
+        ctk.CTkSwitch(warn_card, text="GPU temp warning",
+                      variable=self.warn_var, command=self._on_change,
+                      progress_color=ACCENT).pack(padx=18, pady=(0, 4), anchor="w")
+        thresh_row = ctk.CTkFrame(warn_card, fg_color="transparent")
+        thresh_row.pack(fill="x", padx=18, pady=(0, 10))
+        ctk.CTkLabel(thresh_row, text="Threshold").pack(side="left")
+        self.thresh_var = ctk.StringVar(value=str(self.config_data["temp_warning_threshold"]))
+        self.thresh_entry = ctk.CTkEntry(thresh_row, width=50, textvariable=self.thresh_var)
+        self.thresh_entry.pack(side="left", padx=(8, 4))
+        self.thresh_entry.bind("<FocusOut>", lambda _: self._on_change())
+        self.thresh_entry.bind("<Return>", lambda _: self._on_change())
+        ctk.CTkLabel(thresh_row, text="°C").pack(side="left")
+
+        # Power
+        self.power_warn_var = ctk.BooleanVar(value=self.config_data["power_warning_enabled"])
+        ctk.CTkSwitch(warn_card, text="GPU power-draw warning",
+                      variable=self.power_warn_var, command=self._on_change,
+                      progress_color=ACCENT).pack(padx=18, pady=(0, 4), anchor="w")
+        power_row = ctk.CTkFrame(warn_card, fg_color="transparent")
+        power_row.pack(fill="x", padx=18, pady=(0, 14))
+        ctk.CTkLabel(power_row, text="Threshold").pack(side="left")
+        self.power_thresh_var = ctk.StringVar(value=str(self.config_data["power_warning_threshold"]))
+        self.power_thresh_entry = ctk.CTkEntry(power_row, width=60, textvariable=self.power_thresh_var)
+        self.power_thresh_entry.pack(side="left", padx=(8, 4))
+        self.power_thresh_entry.bind("<FocusOut>", lambda _: self._on_change())
+        self.power_thresh_entry.bind("<Return>", lambda _: self._on_change())
+        ctk.CTkLabel(power_row, text="W").pack(side="left")
+
         # --- Controls card ---
         controls = ctk.CTkFrame(self, fg_color=CARD_BG, corner_radius=10)
         controls.pack(fill="x", padx=PAD_X, pady=(0, 12))
@@ -284,7 +348,20 @@ class App(ctk.CTk):
         except ValueError:
             seconds = self.config_data.get("cycle_seconds", 4)
             self.interval_var.set(str(seconds))
+        try:
+            threshold = max(30, min(120, int(self.thresh_var.get())))
+        except ValueError:
+            threshold = self.config_data.get("temp_warning_threshold", 80)
+            self.thresh_var.set(str(threshold))
+        try:
+            power_threshold = max(50, min(2000, int(self.power_thresh_var.get())))
+        except ValueError:
+            power_threshold = self.config_data.get("power_warning_threshold", 600)
+            self.power_thresh_var.set(str(power_threshold))
+        # Re-read from disk first so we don't overwrite overlay_x/y the daemon
+        # may have just persisted while the user was dragging the warning popup.
         cfg = {
+            **load_config(),
             "line1": self.label_to_key[self.line1_var.get()],
             "line2": self.label_to_key[self.line2_var.get()],
             "alt_line1": self.label_to_key[self.alt1_var.get()],
@@ -292,6 +369,10 @@ class App(ctk.CTk):
             "cycle_enabled": self.cycle_var.get(),
             "cycle_seconds": seconds,
             "gpu_id": self._gpu_id_for_label.get(self.gpu_var.get(), "auto"),
+            "temp_warning_enabled": self.warn_var.get(),
+            "temp_warning_threshold": threshold,
+            "power_warning_enabled": self.power_warn_var.get(),
+            "power_warning_threshold": power_threshold,
         }
         save_config(cfg)
         self.config_data = cfg
@@ -319,9 +400,16 @@ class App(ctk.CTk):
                 install_autostart()
             else:
                 uninstall_autostart()
-        except subprocess.CalledProcessError as e:
-            self.status.configure(text=f"Autostart change failed: {e}", text_color="#e88")
-            self.autostart_var.set(is_autostart_enabled())
+        except Exception as e:
+            try:
+                self.status.configure(
+                    text=f"Autostart: {type(e).__name__}: {e}", text_color="#e88")
+            except Exception:
+                pass
+            try:
+                self.autostart_var.set(is_autostart_enabled())
+            except Exception:
+                pass
 
     def _refresh_status(self) -> None:
         if is_running():
@@ -347,8 +435,14 @@ class App(ctk.CTk):
                                          text_color="#666", font=ctk.CTkFont(size=12))
 
     def _tick(self) -> None:
-        self._update_preview()
-        self._refresh_status()
+        try:
+            self._update_preview()
+            self._refresh_status()
+        except Exception:
+            # report_callback_exception in main.py logs uncaught GUI errors,
+            # but we want the after-chain to keep ticking regardless.
+            import traceback
+            traceback.print_exc()
         self.after(1000, self._tick)
 
 

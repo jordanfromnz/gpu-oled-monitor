@@ -63,35 +63,42 @@ class NvidiaBackend(GpuBackend):
     def name(self) -> str:
         return self._name
 
-    def temperature_c(self) -> Optional[int]:
-        return self._nvml.nvmlDeviceGetTemperature(self._handle,
-                                                   self._nvml.NVML_TEMPERATURE_GPU)
-
-    def power_w(self) -> Optional[float]:
-        return self._nvml.nvmlDeviceGetPowerUsage(self._handle) / 1000.0
-
-    def utilization_pct(self) -> Optional[int]:
-        return self._nvml.nvmlDeviceGetUtilizationRates(self._handle).gpu
-
-    def vram_used_bytes(self) -> Optional[int]:
-        return self._nvml.nvmlDeviceGetMemoryInfo(self._handle).used
-
-    def vram_total_bytes(self) -> Optional[int]:
-        return self._nvml.nvmlDeviceGetMemoryInfo(self._handle).total
-
-    def fan_pct(self) -> Optional[int]:
+    def _safe(self, fn, *args):
         try:
-            return self._nvml.nvmlDeviceGetFanSpeed(self._handle)
+            return fn(*args)
         except self._nvml.NVMLError:
             return None
 
+    def temperature_c(self) -> Optional[int]:
+        return self._safe(self._nvml.nvmlDeviceGetTemperature,
+                          self._handle, self._nvml.NVML_TEMPERATURE_GPU)
+
+    def power_w(self) -> Optional[float]:
+        v = self._safe(self._nvml.nvmlDeviceGetPowerUsage, self._handle)
+        return v / 1000.0 if v is not None else None
+
+    def utilization_pct(self) -> Optional[int]:
+        v = self._safe(self._nvml.nvmlDeviceGetUtilizationRates, self._handle)
+        return v.gpu if v is not None else None
+
+    def vram_used_bytes(self) -> Optional[int]:
+        v = self._safe(self._nvml.nvmlDeviceGetMemoryInfo, self._handle)
+        return v.used if v is not None else None
+
+    def vram_total_bytes(self) -> Optional[int]:
+        v = self._safe(self._nvml.nvmlDeviceGetMemoryInfo, self._handle)
+        return v.total if v is not None else None
+
+    def fan_pct(self) -> Optional[int]:
+        return self._safe(self._nvml.nvmlDeviceGetFanSpeed, self._handle)
+
     def core_clock_mhz(self) -> Optional[int]:
-        return self._nvml.nvmlDeviceGetClockInfo(self._handle,
-                                                 self._nvml.NVML_CLOCK_GRAPHICS)
+        return self._safe(self._nvml.nvmlDeviceGetClockInfo,
+                          self._handle, self._nvml.NVML_CLOCK_GRAPHICS)
 
     def mem_clock_mhz(self) -> Optional[int]:
-        return self._nvml.nvmlDeviceGetClockInfo(self._handle,
-                                                 self._nvml.NVML_CLOCK_MEM)
+        return self._safe(self._nvml.nvmlDeviceGetClockInfo,
+                          self._handle, self._nvml.NVML_CLOCK_MEM)
 
     def shutdown(self) -> None:
         try:

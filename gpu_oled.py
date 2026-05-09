@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import sys
-import time
 from pathlib import Path
 
 import requests
@@ -41,6 +40,14 @@ DEFAULT_CONFIG = {
     "cycle_enabled": False,
     "cycle_seconds": 4,
     "gpu_id": "auto",
+    "temp_warning_enabled": False,
+    "temp_warning_threshold": 80,
+    "overlay_x": 100,
+    "overlay_y": 100,
+    "power_warning_enabled": False,
+    "power_warning_threshold": 600,
+    "power_overlay_x": 100,
+    "power_overlay_y": 210,
 }
 
 
@@ -122,6 +129,19 @@ def write_pid_file() -> None:
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
 
 
+def _make_position_saver(key_x: str, key_y: str):
+    """Returns a callback that persists (x, y) to config under the given keys."""
+    def save(x: int, y: int) -> None:
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+        except json.JSONDecodeError:
+            cfg = {}
+        cfg[key_x] = x
+        cfg[key_y] = y
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    return save
+
+
 def main() -> None:
     write_pid_file()
     log.info("Starting GPU OLED monitor")
@@ -130,32 +150,109 @@ def main() -> None:
     backend = get_backend(config.get("gpu_id", "auto"))
     log.info(f"Monitoring: {backend.name}")
 
-    base = connect()
-    tick = 0
-    try:
-        while True:
-            try:
-                config = load_config()
-                key1, key2 = current_lines(config)
-                push(base, render_line(key1, backend), render_line(key2, backend))
+    base = [connect()]   # mutable cell so the closure can rebind on reconnect
+    tick = [0]
 
-                if tick % HEARTBEAT_EVERY == 0:
-                    heartbeat(base)
-                tick += 1
+    # Hidden tk root — needed for after() scheduling and as the overlay's parent.
+    import customtkinter as ctk
+    from overlay import WarningOverlay
+    root = ctk.CTk()
+    root.withdraw()
+
+    # Two independent warning overlays: temp and power.
+    overlays: dict[str, WarningOverlay | None] = {"temp": None, "power": None}
+
+    OVERLAY_SPECS = {
+        "temp": {
+            "icon": "⚠",
+            "message": "Temps exceeding configured limits",
+            "pos_x_key": "overlay_x",
+            "pos_y_key": "overlay_y",
+            "default_pos": (100, 100),
+        },
+        "power": {
+            "icon": "⚡",
+            "message": "Power draw exceeding configured limits",
+            "pos_x_key": "power_overlay_x",
+            "pos_y_key": "power_overlay_y",
+            "default_pos": (100, 210),
+        },
+    }
+
+    def hide_overlay(kind: str) -> None:
+        if overlays[kind] is not None:
+            try: overlays[kind].destroy()
+            except Exception: pass
+            overlays[kind] = None
+
+    def show_or_update_overlay(kind: str, name: str, value_str: str, cfg: dict) -> None:
+        spec = OVERLAY_SPECS[kind]
+        if overlays[kind] is None:
+            o = WarningOverlay(
+                root, icon=spec["icon"], message=spec["message"],
+                on_position_change=_make_position_saver(spec["pos_x_key"], spec["pos_y_key"]),
+            )
+            x = int(cfg.get(spec["pos_x_key"], spec["default_pos"][0]))
+            y = int(cfg.get(spec["pos_y_key"], spec["default_pos"][1]))
+            o.position_at(x, y)
+            overlays[kind] = o
+        overlays[kind].update_content(name, value_str)
+
+    def check_threshold(kind: str, cfg: dict, enabled_key: str, threshold_key: str,
+                        default_threshold, value, format_value) -> None:
+        if not cfg.get(enabled_key):
+            hide_overlay(kind)
+            return
+        if value is None:
+            return
+        threshold = float(cfg.get(threshold_key, default_threshold))
+        if value >= threshold:
+            show_or_update_overlay(kind, backend.name, format_value(value), cfg)
+        elif value < threshold - 2:
+            hide_overlay(kind)
+
+    def step() -> None:
+        try:
+            cfg = load_config()
+
+            # OLED push
+            try:
+                key1, key2 = current_lines(cfg)
+                push(base[0], render_line(key1, backend), render_line(key2, backend))
+                if tick[0] % HEARTBEAT_EVERY == 0:
+                    heartbeat(base[0])
+                tick[0] += 1
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout,
                     RuntimeError) as e:
-                log.warning(f"GameSense unreachable ({type(e).__name__}); reconnecting in 3s")
-                time.sleep(3)
+                log.warning(f"GameSense unreachable ({type(e).__name__}); reconnecting")
                 try:
-                    base = connect()
+                    base[0] = connect()
                 except Exception as e2:
                     log.warning(f"Reconnect failed: {e2}")
-                    continue
-            time.sleep(POLL_SECONDS)
+
+            check_threshold("temp", cfg,
+                            "temp_warning_enabled", "temp_warning_threshold", 80,
+                            backend.temperature_c(),
+                            lambda v: f"{int(v)}°C")
+            check_threshold("power", cfg,
+                            "power_warning_enabled", "power_warning_threshold", 600,
+                            backend.power_w(),
+                            lambda v: f"{int(round(v))}W")
+        except Exception:
+            log.exception("Unexpected error in tick loop; continuing")
+        root.after(int(POLL_SECONDS * 1000), step)
+
+    root.after(0, step)
+    try:
+        root.mainloop()
     except KeyboardInterrupt:
         log.info("Stopped via KeyboardInterrupt")
     finally:
+        for k in list(overlays.keys()):
+            hide_overlay(k)
+        try: root.destroy()
+        except Exception: pass
         backend.shutdown()
 
 
