@@ -12,6 +12,7 @@ import os
 import sys
 from pathlib import Path
 
+import psutil
 import requests
 
 from gpu_backend import get_backend
@@ -71,6 +72,13 @@ def post(base: str, path: str, payload: dict, timeout: float = 5.0) -> None:
 
 
 def register(base: str) -> None:
+    # Wipe any stale registration first — guarantees a clean bind even after
+    # earlier sessions experimented with different handlers.
+    try:
+        post(base, "/remove_game", {"game": GAME})
+    except Exception as e:
+        log.debug(f"pre-register remove_game (ignored): {e}")
+
     log.info("Registering game metadata")
     post(base, "/game_metadata", {
         "game": GAME,
@@ -129,6 +137,23 @@ def write_pid_file() -> None:
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
 
 
+def another_daemon_running() -> bool:
+    """True iff a different live daemon already owns the PID file.
+
+    Prevents two instances pushing to the OLED simultaneously when both the
+    autostart-spawned daemon and a user-spawned 'Start monitor' run at once.
+    """
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        return False
+    if pid == os.getpid():
+        return False
+    return psutil.pid_exists(pid)
+
+
 def _make_position_saver(key_x: str, key_y: str):
     """Returns a callback that persists (x, y) to config under the given keys."""
     def save(x: int, y: int) -> None:
@@ -143,14 +168,20 @@ def _make_position_saver(key_x: str, key_y: str):
 
 
 def main() -> None:
+    if another_daemon_running():
+        log.info("Another daemon is already running; exiting.")
+        return
     write_pid_file()
     log.info("Starting GPU OLED monitor")
 
     config = load_config()
-    backend = get_backend(config.get("gpu_id", "auto"))
-    log.info(f"Monitoring: {backend.name}")
+    initial_gpu_id = config.get("gpu_id", "auto")
+    # Mutable cells so the step() closure can rebind on reconnect / GPU swap.
+    backend_box = [get_backend(initial_gpu_id)]
+    current_gpu_id = [initial_gpu_id]
+    log.info(f"Monitoring: {backend_box[0].name}")
 
-    base = [connect()]   # mutable cell so the closure can rebind on reconnect
+    base = [connect()]
     tick = [0]
 
     # Hidden tk root — needed for after() scheduling and as the overlay's parent.
@@ -207,13 +238,31 @@ def main() -> None:
             return
         threshold = float(cfg.get(threshold_key, default_threshold))
         if value >= threshold:
-            show_or_update_overlay(kind, backend.name, format_value(value), cfg)
+            show_or_update_overlay(kind, backend_box[0].name, format_value(value), cfg)
         elif value < threshold - 2:
             hide_overlay(kind)
+
+    def maybe_swap_backend(cfg: dict) -> None:
+        """If the user changed gpu_id in the GUI, switch the daemon's backend."""
+        desired = cfg.get("gpu_id", "auto")
+        if desired == current_gpu_id[0]:
+            return
+        try:
+            new_b = get_backend(desired)
+        except Exception as e:
+            log.warning(f"Cannot switch GPU to {desired!r}: {e}")
+            return
+        try: backend_box[0].shutdown()
+        except Exception: pass
+        backend_box[0] = new_b
+        current_gpu_id[0] = desired
+        log.info(f"GPU source switched to: {new_b.name}")
 
     def step() -> None:
         try:
             cfg = load_config()
+            maybe_swap_backend(cfg)
+            backend = backend_box[0]
 
             # OLED push
             try:
@@ -253,7 +302,8 @@ def main() -> None:
             hide_overlay(k)
         try: root.destroy()
         except Exception: pass
-        backend.shutdown()
+        try: backend_box[0].shutdown()
+        except Exception: pass
 
 
 if __name__ == "__main__":

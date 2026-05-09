@@ -1,16 +1,24 @@
 """Configuration GUI for the GPU OLED monitor."""
 
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import customtkinter as ctk
 import psutil
+import requests
 import winreg
 
 from gpu_backend import get_backend, list_gpus
 from stats import STATS, current_lines, render_line
+
+
+# Must match GAME in gpu_oled.py — duplicated to avoid importing the daemon
+# module (and triggering its logging.basicConfig as a side effect).
+GAMESENSE_GAME_ID = "GPU_MONITOR"
 
 
 FROZEN = getattr(sys, "frozen", False)
@@ -61,17 +69,47 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
-def is_running() -> bool:
-    if not PID_FILE.exists():
-        return False
+def _find_daemon_processes() -> list:
+    """All live daemon processes on the system, regardless of PID-file state.
+
+    Catches orphans from older builds, renamed .exes, copies in other folders,
+    and any python process whose command line touches gpu_oled.
+    """
+    me = os.getpid()
+    me_parent = None
     try:
-        pid = int(PID_FILE.read_text().strip())
-        return psutil.pid_exists(pid)
-    except (ValueError, OSError):
-        return False
+        me_parent = psutil.Process(me).ppid()
+    except Exception:
+        pass
+
+    matches = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            pid = proc.info["pid"]
+            if pid == me or pid == me_parent:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            joined = " ".join(cmdline).lower()
+            name = (proc.info.get("name") or "").lower()
+            # Broad match — anything whose name or cmdline references the
+            # project's daemon. Catches `pythonw.exe gpu_oled.py`, the .exe
+            # under any name, and renamed copies.
+            tokens = ("gpu_oled", "gpu-oled-monitor", "gpu-oled-daemon")
+            if any(t in name for t in tokens) or any(t in joined for t in tokens):
+                matches.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return matches
+
+
+def is_running() -> bool:
+    return len(_find_daemon_processes()) > 0
 
 
 def start_monitor() -> None:
+    # Wipe any orphan daemons before spawning a fresh one so we never end up
+    # with two pushing to the OLED at the same time.
+    stop_monitor()
     subprocess.Popen(
         daemon_command(),
         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
@@ -81,17 +119,52 @@ def start_monitor() -> None:
     )
 
 
-def stop_monitor() -> None:
-    if not PID_FILE.exists():
-        return
+def _gamesense_address() -> str:
+    core_props = (Path(os.environ["PROGRAMDATA"]) /
+                  "SteelSeries" / "SteelSeries Engine 3" / "coreProps.json")
+    return json.loads(core_props.read_text())["address"]
+
+
+def _gg_remove_game() -> None:
+    """Best-effort wipe of our GameSense registration.
+
+    GG caches the last few screen frames and keeps replaying them after
+    /remove_game (its own behavior, not ours). Counter that by pushing a
+    handful of blank frames first so the cached cycle becomes blank/blank.
+    """
     try:
-        pid = int(PID_FILE.read_text().strip())
-        proc = psutil.Process(pid)
-        proc.terminate()
-        proc.wait(timeout=3)
-    except (psutil.NoSuchProcess, psutil.TimeoutExpired, ValueError):
+        addr = _gamesense_address()
+    except Exception:
+        return
+    blank_event = {
+        "game": GAMESENSE_GAME_ID, "event": "GPU_STATS",
+        "data": {"value": 0, "frame": {"line1": " ", "line2": " "}},
+    }
+    for _ in range(5):
+        try:
+            requests.post(f"http://{addr}/game_event", json=blank_event, timeout=2)
+        except Exception:
+            pass
+        time.sleep(0.3)
+    try:
+        requests.post(f"http://{addr}/remove_game",
+                      json={"game": GAMESENSE_GAME_ID}, timeout=3)
+    except Exception:
         pass
+
+
+def stop_monitor() -> None:
+    procs = _find_daemon_processes()
+    for proc in procs:
+        try: proc.terminate()
+        except Exception: pass
+    if procs:
+        gone, alive = psutil.wait_procs(procs, timeout=3)
+        for proc in alive:
+            try: proc.kill()
+            except Exception: pass
     PID_FILE.unlink(missing_ok=True)
+    _gg_remove_game()
 
 
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -156,8 +229,8 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("GPU OLED Monitor")
-        self.geometry("420x1000")
-        self.resizable(False, False)
+        self.geometry("460x720")
+        self.minsize(460, 520)
 
         self.config_data = load_config()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -175,13 +248,33 @@ class App(ctk.CTk):
         self.key_to_label = {s.key: s.label for s in STATS.values()}
         labels = list(self.label_to_key.keys())
 
-        # --- Credit (packed first so side=bottom reserves its slot) ---
+        # --- Pinned bottom area (credit + Controls card always visible) ---
+        # Pack order: credit first, controls above it, then scroll fills the rest.
         ctk.CTkLabel(self, text="made by jordanfromnz",
                      font=ctk.CTkFont(size=10), text_color="#555").pack(side="bottom", pady=(0, 8))
 
+        controls = ctk.CTkFrame(self, fg_color=CARD_BG, corner_radius=10)
+        controls.pack(side="bottom", fill="x", padx=PAD_X, pady=(8, 4))
+
+        self.run_btn = ctk.CTkButton(controls, text="Start monitor", command=self._toggle_running,
+                                     fg_color=ACCENT, hover_color=GREEN_DIM, text_color="#000")
+        self.run_btn.pack(fill="x", padx=18, pady=(14, 8))
+
+        self.autostart_var = ctk.BooleanVar(value=is_autostart_enabled())
+        ctk.CTkSwitch(controls, text="Run at login", variable=self.autostart_var,
+                      command=self._toggle_autostart,
+                      progress_color=ACCENT).pack(padx=18, pady=(0, 8), anchor="w")
+
+        self.status = ctk.CTkLabel(controls, text="", anchor="w")
+        self.status.pack(fill="x", padx=18, pady=(0, 14))
+
+        # --- Scrollable area for everything else ---
+        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll.pack(side="top", fill="both", expand=True)
+
         # --- Header ---
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=PAD_X, pady=(18, 12))
+        header = ctk.CTkFrame(scroll, fg_color="transparent")
+        header.pack(fill="x", padx=PAD_X - 6, pady=(8, 12))
         ctk.CTkLabel(header, text="GPU OLED Monitor",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(anchor="w")
         ctk.CTkLabel(header, text="Apex Pro Gen3  ·  GameSense",
@@ -190,8 +283,8 @@ class App(ctk.CTk):
         # --- GPU source ---
         current_gpu_label = self._label_for_gpu_id.get(
             self.config_data.get("gpu_id", "auto"), "Auto")
-        gpu_card = ctk.CTkFrame(self, fg_color=CARD_BG, corner_radius=10)
-        gpu_card.pack(fill="x", padx=PAD_X, pady=(0, 12))
+        gpu_card = ctk.CTkFrame(scroll, fg_color=CARD_BG, corner_radius=10)
+        gpu_card.pack(fill="x", padx=PAD_X - 6, pady=(0, 12))
         ctk.CTkLabel(gpu_card, text="GPU SOURCE",
                      font=ctk.CTkFont(size=11, weight="bold"),
                      text_color=ACCENT).pack(padx=18, pady=(14, 4), anchor="w")
@@ -202,9 +295,9 @@ class App(ctk.CTk):
                           ).pack(fill="x", padx=18, pady=(0, 14))
 
         # --- OLED preview ---
-        preview = ctk.CTkFrame(self, fg_color=OLED_BG, corner_radius=10, height=110,
+        preview = ctk.CTkFrame(scroll, fg_color=OLED_BG, corner_radius=10, height=110,
                                border_width=1, border_color="#2a2a2e")
-        preview.pack(fill="x", padx=PAD_X, pady=(0, 16))
+        preview.pack(fill="x", padx=PAD_X - 6, pady=(0, 16))
         preview.pack_propagate(False)
         self.preview_label = ctk.CTkLabel(
             preview, text="—", justify="left", text_color="#FFFFFF",
@@ -213,8 +306,8 @@ class App(ctk.CTk):
         self.preview_label.pack(expand=True)
 
         # --- Settings card ---
-        settings = ctk.CTkFrame(self, fg_color=CARD_BG, corner_radius=10)
-        settings.pack(fill="x", padx=PAD_X, pady=(0, 12))
+        settings = ctk.CTkFrame(scroll, fg_color=CARD_BG, corner_radius=10)
+        settings.pack(fill="x", padx=PAD_X - 6, pady=(0, 12))
 
         self._section(settings, "Page 1")
         self.line1_var = self._dropdown(settings, "Top line", self.config_data["line1"], labels)
@@ -245,8 +338,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(interval_row, text="seconds").pack(side="left")
 
         # --- Warnings card ---
-        warn_card = ctk.CTkFrame(self, fg_color=CARD_BG, corner_radius=10)
-        warn_card.pack(fill="x", padx=PAD_X, pady=(0, 12))
+        warn_card = ctk.CTkFrame(scroll, fg_color=CARD_BG, corner_radius=10)
+        warn_card.pack(fill="x", padx=PAD_X - 6, pady=(0, 12))
         self._section(warn_card, "Warnings")
 
         # Temp
@@ -278,22 +371,6 @@ class App(ctk.CTk):
         self.power_thresh_entry.bind("<FocusOut>", lambda _: self._on_change())
         self.power_thresh_entry.bind("<Return>", lambda _: self._on_change())
         ctk.CTkLabel(power_row, text="W").pack(side="left")
-
-        # --- Controls card ---
-        controls = ctk.CTkFrame(self, fg_color=CARD_BG, corner_radius=10)
-        controls.pack(fill="x", padx=PAD_X, pady=(0, 12))
-
-        self.run_btn = ctk.CTkButton(controls, text="Start monitor", command=self._toggle_running,
-                                     fg_color=ACCENT, hover_color=GREEN_DIM, text_color="#000")
-        self.run_btn.pack(fill="x", padx=18, pady=(16, 10))
-
-        self.autostart_var = ctk.BooleanVar(value=is_autostart_enabled())
-        ctk.CTkSwitch(controls, text="Run at login", variable=self.autostart_var,
-                      command=self._toggle_autostart,
-                      progress_color=ACCENT).pack(padx=18, pady=(0, 12), anchor="w")
-
-        self.status = ctk.CTkLabel(controls, text="", anchor="w")
-        self.status.pack(fill="x", padx=18, pady=(0, 16))
 
         self._apply_cycle_state()
         self._refresh_status()

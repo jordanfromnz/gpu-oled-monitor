@@ -83,7 +83,7 @@ def _ram_used(_b: GpuBackend) -> str:
 STATS: dict[str, Stat] = {
     s.key: s for s in [
         Stat("gpu_temp",   "GPU Temperature", "° GPU",  _temp),
-        Stat("gpu_power",  "Power Draw",      "⚡ PWR",  _power),
+        Stat("gpu_power",  "GPU Power Draw",  "⚡ PWR",  _power),
         Stat("gpu_util",   "GPU Usage",       "▓ GPU",  _gpu_util),
         Stat("mem_pct",    "VRAM Usage %",    "▤ VRAM", _mem_pct),
         Stat("mem_used",   "VRAM Used",       "▤ VRAM", _mem_used),
