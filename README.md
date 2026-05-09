@@ -10,7 +10,8 @@ Single `.exe`. No HWiNFO. No INI editing. Pick your stats, click run.
 - Inline icons per stat (`° GPU 32°C`, `⚡ PWR 65.2W`, …)
 - Two-page cycling — show up to four stats, alternating between pages
 - Clean configuration GUI with a live OLED preview
-- One-click "Run at login" via Windows Task Scheduler
+- **Threshold warnings** — frameless always-on-top desktop popups when GPU temperature or power draw exceeds your configured limits (default 80°C / 600W). Position is remembered.
+- One-click "Run at login" (registers under the user-scope Windows autostart key — no admin, no scheduled task)
 - NVIDIA (NVML) and AMD (ADL / ADL2 PMLogData) support
 - Resilient to SteelSeries Engine restarts (port rotation handled automatically)
 
@@ -19,7 +20,7 @@ Single `.exe`. No HWiNFO. No INI editing. Pick your stats, click run.
 **GPU** — temperature, power draw, usage %, VRAM used, VRAM %, fan %, core clock, memory clock
 **System** — CPU usage %, RAM usage %, RAM used
 
-CPU temperature isn't availalble for now — reading it would require integration with HWInfo Stats. If you need CPU temp or other stats not available from nvml, [HWiNFO-SteelSeries](https://github.com/ForbesGRyan/HWiNFO-SteelSeries) covers that path well. This was primarily built as a GPU monitoring display for temp and power draw.
+CPU temperature isn't available for now — reading it would require integration with HWInfo Stats. If you need CPU temp or other stats not available from nvml, [HWiNFO-SteelSeries](https://github.com/ForbesGRyan/HWiNFO-SteelSeries) covers that path well. This was primarily built as a GPU monitoring display for temp and power draw.
 
 ## Requirements
 
@@ -48,11 +49,30 @@ The GUI saves to `config.json` next to the executable. You can edit it by hand i
   "alt_line2": "ram_pct",
   "cycle_enabled": true,
   "cycle_seconds": 4,
-  "gpu_id": "auto"
+  "gpu_id": "auto",
+
+  "temp_warning_enabled": false,
+  "temp_warning_threshold": 80,
+  "overlay_x": 100,
+  "overlay_y": 100,
+
+  "power_warning_enabled": false,
+  "power_warning_threshold": 600,
+  "power_overlay_x": 100,
+  "power_overlay_y": 210
 }
 ```
 
 `gpu_id` is `"auto"` by default, or `"nvidia:0"` / `"amd:1"` to pin a specific card.
+
+## Threshold warnings
+
+When enabled, a frameless always-on-top popup appears whenever the relevant metric exceeds its threshold, and disappears once it drops a couple of degrees/watts below (hysteresis to avoid flicker). Each popup is independent and draggable — its position is saved to `config.json` and restored on the next launch.
+
+- **Temp** — defaults to **80 °C**. Useful as an early-warning if airflow gets blocked or fan curves stop responding.
+- **Power draw** — defaults to **600 W**, the rated limit of the 12VHPWR connector. Particularly relevant on cards like the RTX 5090 that can transiently spike past it; pairing the warning with the OLED makes it visible whether your eyes are on the keyboard or the desktop.
+
+Both warnings only fire while the daemon is running — same lifecycle as the OLED stat push. Toggle them on/off in the GUI's *Warnings* card.
 
 ## AMD support
 
@@ -86,10 +106,11 @@ python -m PyInstaller --noconfirm --noconsole --onefile --name "GPU-OLED-Monitor
 |------|---------|
 | `main.py` | Entry point: dispatches to GUI or daemon based on `--daemon` flag |
 | `config_app.py` | customtkinter GUI |
-| `gpu_oled.py` | Daemon that polls stats and pushes to GameSense |
+| `gpu_oled.py` | Daemon that polls stats, pushes to GameSense, and hosts warning overlays |
 | `gpu_backend.py` | NVIDIA + AMD vendor abstraction |
+| `overlay.py` | Frameless always-on-top warning popup |
 | `stats.py` | Available stat formatters and the inline-icon palette |
-| `config.json` | User config (line selections, cycle settings, gpu_id) |
+| `config.json` | User config (lines, cycle, gpu_id, warning thresholds & positions) |
 
 ## Credits
 
